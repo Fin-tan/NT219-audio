@@ -21,5 +21,5 @@ class ChaoticStreamCipher:
         return bytes(a ^ b for a, b in zip(data, ks))
 
     def decrypt(self, data):
-        # symmetric
+        # symmetricAESAES
         return self.encrypt(data)
