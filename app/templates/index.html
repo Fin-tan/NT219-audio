@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream Nhạc Bảo Mật</title>
+</head>
+<body>
+    <h1>Chọn bài nhạc để phát</h1>
+    <form id="playForm">
+        <label for="trackSelect">Bài nhạc:</label>
+        <select id="trackSelect" name="track">
+            {% for track in tracks %}
+            <option value="{{ track }}">{{ track }}</option>
+            {% endfor %}
+        </select>
+        <br><br>
+        <label>Chế độ mã hóa:</label>
+        <input type="radio" id="plain" name="mode" value="plain" checked>
+        <label for="plain">Không mã hóa (Plain)</label>
+        <input type="radio" id="aes" name="mode" value="aes">
+        <label for="aes">AES</label>
+        <input type="radio" id="chaotic" name="mode" value="chaotic">
+        <label for="chaotic">Chaotic Stream Cipher</label>
+        <br><br>
+        <button type="button" onclick="startPlayback()">Phát</button>
+    </form>
+
+    <hr>
+    <audio id="audioPlayer" controls></audio>
+
+    <script src="/static/client_player.js"></script>
+</body>
+</html>
