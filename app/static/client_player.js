@@ -33,129 +33,142 @@ function hexStringToUint8Array(hex) {
     return u8;
 }
 
+document.getElementById('playButton').addEventListener('click', startPlayback);
+
 async function startPlayback() {
-    const track = document.getElementById('trackSelect').value;
+    const trackSelect = document.getElementById('trackSelect');
     const mode = document.querySelector('input[name="mode"]:checked').value;
     const audioPlayer = document.getElementById('audioPlayer');
-    const ext = track.split('.').pop().toLowerCase();
-    let contentType = (ext === 'wav') ? 'audio/wav' : 'audio/mpeg';
+    const track = trackSelect.value;
 
-    // Reset audio
     audioPlayer.pause();
-    audioPlayer.removeAttribute('src');
-    audioPlayer.load();
+    audioPlayer.src = '';
+
+    // Kiểm tra login (JS client-side)
+    // Tùy thuộc vào cách bạn xử lý xác thực trên client
+    // Hiện tại Flask sẽ chuyển hướng nếu chưa login, nên phần này có thể không cần thiết
+    // nhưng tốt để có nếu bạn có logic JS phức tạp hơn.
 
     if (mode === 'plain') {
         audioPlayer.src = `/static/${track}`;
-        audioPlayer.type = contentType;
         audioPlayer.play();
 
     } else if (mode === 'aes') {
-        const response = await fetch(`/stream/${track}/aes`);
+        // Giữ nguyên logic AES (chú ý vấn đề lưu key trong localStorage)
+        // Trong hệ thống thực tế, bạn cũng sẽ lấy key AES theo session
+        const response = await fetch(`/stream/${track}/aes_encrypted`); // Đổi tên route để khớp với server
         const arrayBuffer = await response.arrayBuffer();
-        const encrypted = new Uint8Array(arrayBuffer);
-        const keyHex = localStorage.getItem('aesKey');
-        if (!keyHex) return alert("Thiếu aesKey trong localStorage");
-        const iv = encrypted.slice(0, 16);
-        const data = encrypted.slice(16);
-        const cryptoKey = await crypto.subtle.importKey(
-            'raw', hexStringToUint8Array(keyHex), { name: 'AES-CFB' }, false, ['decrypt']
-        );
-        const decrypted = await crypto.subtle.decrypt(
-            { name: 'AES-CFB', iv: iv }, cryptoKey, data
-        );
-        const blob = new Blob([decrypted], { type: contentType });
-        audioPlayer.src = URL.createObjectURL(blob);
-        audioPlayer.play();
+        const encryptedBytes = new Uint8Array(arrayBuffer);
+        const key = localStorage.getItem('aesKey'); // Key vẫn đang lấy từ localStorage
+        const iv = encryptedBytes.slice(0, 16);
+        const data = encryptedBytes.slice(16);
+        
+        try {
+            const cryptoKey = await window.crypto.subtle.importKey(
+                'raw',
+                hexStringToUint8Array(key),
+                { name: 'AES-CFB' },
+                false,
+                ['decrypt']
+            );
+            const decryptedArrayBuffer = await window.crypto.subtle.decrypt(
+                { name: 'AES-CFB', iv: iv },
+                cryptoKey,
+                data
+            );
+            const blob = new Blob([decryptedArrayBuffer], { type: 'audio/mpeg' });
+            audioPlayer.src = URL.createObjectURL(blob);
+            audioPlayer.play();
+        } catch (e) {
+            console.error("Lỗi giải mã AES. Key hoặc dữ liệu có thể không đúng:", e);
+            alert("Không thể giải mã file AES. Vui lòng kiểm tra khóa hoặc file.");
+        }
 
     } else if (mode === 'chaotic') {
-    const scc = new ChaoticStreamCipher_js(0.6, 3.99);
-    const source = new MediaSource();
-    audioPlayer.src = URL.createObjectURL(source);
+        // --- BƯỚC MỚI: Yêu cầu seed từ Server ---
+        let chaoticSeed = null;
+        try {
+            const keyResponse = await fetch('/get_chaotic_session_key');
+            if (!keyResponse.ok) {
+                if (keyResponse.status === 401) {
+                    alert('Bạn chưa đăng nhập hoặc phiên đã hết hạn. Vui lòng đăng nhập lại.');
+                    window.location.href = '/login'; // Chuyển hướng về trang login
+                    return;
+                }
+                throw new Error(`Server returned status ${keyResponse.status}`);
+            }
+            const keyData = await keyResponse.json();
+            chaoticSeed = keyData.seed;
+            const chaoticMu = keyData.mu;
+            console.log(`[CLIENT] Đã nhận Chaotic Seed từ server: ${chaoticSeed}, Mu: ${chaoticMu}`);
+            // Lưu ý: Chúng ta không lưu seed này vào localStorage nữa, nó chỉ tồn tại trong bộ nhớ
+            // và được dùng ngay cho phiên này.
+        } catch (e) {
+            console.error("Lỗi khi lấy Chaotic Seed từ server:", e);
+            alert("Không thể lấy khóa streaming. Vui lòng thử lại.");
+            return;
+        }
+        // ------------------------------------------
 
-    source.addEventListener('sourceopen', async () => {
-        const mimeCodec = 'audio/mpeg'; // Đảm bảo MIME type này đúng với dữ liệu giải mã
-        const buffer = source.addSourceBuffer(mimeCodec);
+        const scc = new ChaoticStreamCipher_js(chaoticSeed, 3.99); // Sử dụng seed từ server
+        const source = new MediaSource();
+        audioPlayer.src = URL.createObjectURL(source);
         
-        // Theo dõi trạng thái của SourceBuffer để biết khi nào nó sẵn sàng
-        // và khi nào có thể thêm chunk tiếp theo
-        buffer.addEventListener('updateend', () => {
-            // Khi buffer hoàn thành việc cập nhật (thêm chunk)
-            // Nếu đủ dữ liệu trong buffer và chưa phát, bắt đầu phát
-            if (!audioPlayer.paused && audioPlayer.currentTime === 0 && buffer.buffered.length > 0) {
-                // Kiểm tra xem đã có dữ liệu trong buffer chưa
-                // và trình phát đang ở trạng thái dừng và chưa phát
-                // Nếu có đủ dữ liệu, bắt đầu phát
-                audioPlayer.play().catch(e => console.error("Lỗi khi play audio:", e));
+        source.addEventListener('sourceopen', async () => {
+            const mimeCodec = 'audio/mpeg'; 
+            const buffer = source.addSourceBuffer(mimeCodec);
+            
+            buffer.addEventListener('updateend', () => {
+                if (!audioPlayer.paused && audioPlayer.currentTime === 0 && buffer.buffered.length > 0) {
+                    audioPlayer.play().catch(e => console.error("Lỗi khi play audio:", e));
+                }
+            });
+
+            const response = await fetch(`/stream/${track}/chaotic`);
+            const reader = response.body.getReader();
+
+            let isPlaying = false; 
+            let chunkCount = 0;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    if (!buffer.updating) {
+                        source.endOfStream();
+                        console.log("[Chaotic] Hết chunk → endOfStream()");
+                    } else {
+                        buffer.addEventListener('updateend', () => {
+                            source.endOfStream();
+                            console.log("[Chaotic] Hết chunk → endOfStream() sau updateend");
+                        }, { once: true });
+                    }
+                    break;
+                }
+                
+                chunkCount++; 
+                console.log(`[Chaotic] Nhận chunk ${value.length} byte (Chunk #${chunkCount})`);
+                
+                const decrypted = scc.decrypt(value); 
+
+                // In plain text đã giải mã (cho debug)
+                console.log(`[Chaotic] Decrypted Plain Bytes (first 50 of chunk): ${decrypted.slice(0, 50).join(', ')}...`);
+                
+                while (buffer.updating) {
+                    await new Promise(resolve => setTimeout(resolve, 10));
+                }
+
+                try {
+                    buffer.appendBuffer(decrypted);
+                    if (!isPlaying && audioPlayer.paused && buffer.buffered.length > 0) {
+                        audioPlayer.play().catch(e => console.error("Lỗi khi play audio (early):", e));
+                        isPlaying = true;
+                    }
+                } catch (e) {
+                    console.error("Lỗi khi appendBuffer:", e);
+                    source.endOfStream("decode");
+                    break;
+                }
             }
         });
-
-        const response = await fetch(`/stream/${track}/chaotic`);
-        const reader = response.body.getReader();
-
-        let isPlaying = false; // Biến cờ để kiểm soát việc gọi play()
-
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) {
-                // Đợi cho SourceBuffer xử lý hết các chunk cuối cùng
-                // trước khi kết thúc stream
-                if (!buffer.updating) {
-                    source.endOfStream();
-                    console.log("[Chaotic] Hết chunk → endOfStream()");
-                } else {
-                    // Đợi updateend cuối cùng nếu buffer vẫn đang cập nhật
-                    buffer.addEventListener('updateend', () => {
-                        source.endOfStream();
-                        console.log("[Chaotic] Hết chunk → endOfStream() sau updateend");
-                    }, { once: true });
-                }
-                break;
-            }
-
-            console.log(`[Chaotic] Nhận chunk ${value.length} byte`);
-            const decrypted = scc.decrypt(value);
-            
-            // Đợi SourceBuffer hoàn thành việc cập nhật trước khi thêm chunk mới
-            // Điều này là **quan trọng** để tránh lỗi InvalidStateError
-            // khi appendBuffer trong khi buffer đang bận
-            while (buffer.updating) {
-                await new Promise(resolve => setTimeout(resolve, 10)); // Đợi một chút
-            }
-
-            try {
-                buffer.appendBuffer(decrypted);
-                // Bắt đầu phát ngay khi có chunk đầu tiên được thêm thành công
-                if (!isPlaying && audioPlayer.paused && buffer.buffered.length > 0) {
-                     // Kiểm tra xem có ít nhất một đoạn dữ liệu trong buffer
-                    audioPlayer.play().catch(e => console.error("Lỗi khi play audio (early):", e));
-                    isPlaying = true; // Đánh dấu đã bắt đầu phát
-                }
-            } catch (e) {
-                console.error("Lỗi khi appendBuffer:", e);
-                // Xử lý lỗi, có thể dừng stream hoặc thử lại
-                source.endOfStream("decode"); // Kết thúc stream với lỗi giải mã
-                break;
-            }
-        }
-    });
-}
-
-    // Fallback: giải mã toàn bộ rồi tạo Blob
-    async function fallbackChaoticFullDecode() {
-        console.warn("[Chaotic-Fallback] Decode toàn bộ rồi tạo Blob rồi play");
-        const scc = new ChaoticStreamCipher_js(0.6, 3.99);
-        const response = await fetch(`/stream/${track}/chaotic`);
-        const reader = response.body.getReader();
-        const chunks = [];
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!value) continue;
-            chunks.push(scc.decrypt(value));
-        }
-        const blob = new Blob(chunks, { type: contentType });
-        audioPlayer.src = URL.createObjectURL(blob);
-        audioPlayer.play();
     }
 }

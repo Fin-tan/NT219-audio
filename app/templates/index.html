@@ -1,34 +1,46 @@
 <!DOCTYPE html>
-<html lang="vi">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Stream Nhạc Bảo Mật</title>
+    <title>Streamer App</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-    <h1>Chọn bài nhạc để phát</h1>
-    <form id="playForm">
-        <label for="trackSelect">Bài nhạc:</label>
-        <select id="trackSelect" name="track">
-            {% for track in tracks %}
-            <option value="{{ track }}">{{ track }}</option>
-            {% endfor %}
-        </select>
-        <br><br>
-        <label>Chế độ mã hóa:</label>
-        <input type="radio" id="plain" name="mode" value="plain" checked>
-        <label for="plain">Không mã hóa (Plain)</label>
-        <input type="radio" id="aes" name="mode" value="aes">
-        <label for="aes">AES</label>
-        <input type="radio" id="chaotic" name="mode" value="chaotic">
-        <label for="chaotic">Chaotic Stream Cipher</label>
-        <br><br>
-        <button type="button" onclick="startPlayback()">Phát</button>
-    </form>
+    <div class="container">
+        <div class="header">
+            <h1>Streamer App</h1>
+            <div class="user-info">
+                <span>Xin chào, {{ username }}!</span>
+                <a href="/logout" class="logout-btn">Đăng xuất</a>
+            </div>
+        </div>
+        
+        <div class="controls">
+            <label for="trackSelect">Chọn track:</label>
+            <select id="trackSelect">
+                {% for track in tracks %}
+                    <option value="{{ track }}">{{ track }}</option>
+                {% endfor %}
+            </select>
 
-    <hr>
-    <audio id="audioPlayer" controls></audio>
+            <fieldset>
+                <legend>Chế độ phát:</legend>
+                <input type="radio" id="modePlain" name="mode" value="plain" checked>
+                <label for="modePlain">Plain</label><br>
+                <input type="radio" id="modeAES" name="mode" value="aes">
+                <label for="modeAES">AES (toàn bộ)</label><br>
+                <input type="radio" id="modeChaotic" name="mode" value="chaotic">
+                <label for="modeChaotic">Chaotic (streaming)</label>
+            </fieldset>
 
-    <script src="/static/client_player.js"></script>
+            <button id="playButton">Play</button>
+        </div>
+
+        <audio id="audioPlayer" controls></audio>
+    </div>
+
+    <script src="{{ url_for('static', filename='stream_cipher.js') }}"></script>
+    <script src="{{ url_for('static', filename='client_player.js') }}"></script>
 </body>
 </html>
