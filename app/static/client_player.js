@@ -170,5 +170,70 @@ async function startPlayback() {
                 }
             }
         });
+    } else if (mode === 'aeschaotic') {
+        // Hybrid AES-GCM → Chaotic
+        let chaoticSeed = null;
+        try {
+            const keyResp = await fetch('/get_chaotic_session_key');
+            if (!keyResp.ok) {
+                if (keyResp.status === 401) {
+                    alert('Bạn chưa đăng nhập hoặc phiên đã hết hạn.');
+                    window.location.href = '/login';
+                    return;
+                }
+                throw new Error(`Server trả status ${keyResp.status}`);
+            }
+            chaoticSeed = (await keyResp.json()).seed;
+        } catch (e) {
+            console.error("Lỗi khi lấy Chaotic seed:", e);
+            alert("Không thể lấy Chaotic key. Vui lòng thử lại.");
+            return;
+        }
+
+        const scc = new ChaoticStreamCipher_js(chaoticSeed, 3.99);
+        const mediaSource = new MediaSource();
+        audioPlayer.src = URL.createObjectURL(mediaSource);
+
+        mediaSource.addEventListener('sourceopen', async () => {
+            const mimeCodec = 'audio/mpeg';
+            const sourceBuffer = mediaSource.addSourceBuffer(mimeCodec);
+            const response = await fetch(`/stream/${track}/aeschaotic`);
+            if (!response.ok) {
+                console.error("Lỗi khi fetch AES-Chaotic stream:", response.status);
+                return;
+            }
+            const reader = response.body.getReader();
+            let isPlaying = false;
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) {
+                    if (!sourceBuffer.updating) {
+                        mediaSource.endOfStream();
+                    } else {
+                        sourceBuffer.addEventListener('updateend', () => mediaSource.endOfStream(), { once: true });
+                    }
+                    break;
+                }
+                // Đây là chunk plaintext đã được AES-GCM giải xong trên server, 
+                // nhưng sau đó server đã Chaotic-encrypt lại. 
+                // Bên client cần Chaotic-decrypt để lấy lại audio gốc.
+                const decryptedChunk = scc.decrypt(value);
+                while (sourceBuffer.updating) {
+                    await new Promise(res => setTimeout(res, 10));
+                }
+                try {
+                    sourceBuffer.appendBuffer(decryptedChunk);
+                    if (!isPlaying && audioPlayer.paused && sourceBuffer.buffered.length > 0) {
+                        audioPlayer.play().catch(e => console.error("Lỗi khi play audio:", e));
+                        isPlaying = true;
+                    }
+                } catch (e) {
+                    console.error("Lỗi appendBuffer (AES-Chaotic):", e);
+                    mediaSource.endOfStream("decode");
+                    break;
+                }
+            }
+        });
     }
+
 }
