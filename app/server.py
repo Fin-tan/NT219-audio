@@ -11,10 +11,10 @@ from Crypto.Cipher import AES as PyAES  # Dùng để giải mã AES-CFB nếu c
 app = Flask(__name__, template_folder='templates')
 
 # --- Cấu hình Session ---
-app.config['SECRET_KEY'] = 'your_super_secret_key_here_change_this_in_production' # Rất quan trọng! Thay đổi trong sản phẩm!
+app.config['SECRET_KEY'] = secrets.token_hex(16) # Rất quan trọng! Thay đổi trong sản phẩm!
 app.config['SESSION_TYPE'] = 'filesystem'  # Lưu session trên filesystem (đơn giản cho demo)
-# app.config['SESSION_COOKIE_SECURE'] = True # Chỉ gửi cookie qua HTTPS (nên dùng trong sản phẩm)
-# app.config['SESSION_COOKIE_HTTPONLY'] = True # Ngăn JS truy cập cookie (nên dùng)
+app.config['SESSION_COOKIE_SECURE'] = True # Chỉ gửi cookie qua HTTPS (nên dùng trong sản phẩm)
+app.config['SESSION_COOKIE_HTTPONLY'] = True # Ngăn JS truy cập cookie (nên dùng)
 Session(app)
 # ------------------------
 

@@ -1,5 +1,5 @@
 class ChaoticStreamCipher_js {
-    constructor(seed = 0.6, mu = 3.99) {
+    constructor(seed, mu) {
         this.x = seed;
         this.mu = mu;
     }
