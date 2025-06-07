@@ -3,11 +3,20 @@ import secrets # Để tạo khóa/seed ngẫu nhiên an toàn
 from flask import Flask, render_template, request, session, redirect, url_for, Response, abort, send_from_directory
 from flask_session import Session # Để quản lý session
 
+
 # Giả định ChaoticStreamCipher và aes_key đã được định nghĩa
 from stream_cipher import ChaoticStreamCipher
 # from storage import aes_key # Nếu bạn muốn dùng aes_key từ file khác
 from storage_gcm_db import init_db, encrypt_and_save_to_db, get_encrypted_blob, aes_key
 from Crypto.Cipher import AES as PyAES  # Dùng để giải mã AES-CFB nếu cần
+# >>> ECC START: import thêm cho ECDH + AESGCM
+import os, base64, secrets
+from cryptography.hazmat.primitives.serialization import load_der_public_key
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+# <<< ECC END
 app = Flask(__name__, template_folder='templates')
 
 # --- Cấu hình Session ---
@@ -17,7 +26,14 @@ app.config['SESSION_COOKIE_SECURE'] = True # Chỉ gửi cookie qua HTTPS (nên 
 app.config['SESSION_COOKIE_HTTPONLY'] = True # Ngăn JS truy cập cookie (nên dùng)
 Session(app)
 # ------------------------
-
+# >>> ECC START: khởi tạo ECC key pair server
+server_priv_key = ec.generate_private_key(ec.SECP256R1())
+server_pub_key = server_priv_key.public_key()
+server_pub_pem = server_pub_key.public_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PublicFormat.SubjectPublicKeyInfo
+)
+# <<< ECC END
 # --- Cấu hình đường dẫn file ---
 BASE_PATH = os.path.join(os.path.dirname(__file__), 'static')
 ENCRYPTED_DIR = os.path.join(os.path.dirname(__file__), 'encrypted')
@@ -66,23 +82,49 @@ def logout():
     # Xóa bất kỳ khóa session nào đã tạo
     session.pop('chaotic_seed', None) 
     return redirect(url_for('login'))
+#-- router cung cấp key pem
+@app.route('/ecdh/server_pub_key')
+def get_server_pub_key():
+    return Response(server_pub_pem, mimetype='application/octet-stream')
 
 # --- Route mới để CẤP KHÓA THEO SESSION ---
-@app.route('/get_chaotic_session_key')
-def get_chaotic_session_key():
-    if 'logged_in' not in session or not session['logged_in']:
-        return abort(401) # Unauthorized
+@app.route('/ecdh/request_seed', methods=['POST'])
+def ecdh_request_seed():
+    data = request.get_json()
+    client_pub_b64 = data.get('client_pub')
+    if not client_pub_b64:
+        abort(400, "Missing client public key")
 
-    # Tạo một seed ngẫu nhiên cho phiên hiện tại
-    # secrets.randbelow(N) trả về một số nguyên ngẫu nhiên < N
-    # Để có float từ 0 đến 1, chúng ta chia cho một số lớn
+    # >>> CHỖ SỬA: decode base64 DER và load bằng load_der_public_key
+    raw = base64.b64decode(client_pub_b64)
+    try:
+        client_pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), raw)
+    except ValueError as e:
+        app.logger.error(f"Invalid raw public key: {e}")
+        abort(400, "Invalid client public key format")
+
+    # Derive shared secret
+    shared = server_priv_key.exchange(ec.ECDH(), client_pub)
+
+    # HKDF → 32 bytes key
+    aes_key_derived = HKDF(
+        algorithm=hashes.SHA256(), length=32,
+        salt=None, info=b'chaotic-seed'
+    ).derive(shared)
+
+    # Tạo và lưu seed Chaotic
     random_seed = secrets.randbelow(1_000_000_000) / 1_000_000_000.0
-    
-    # Lưu seed này vào session của người dùng
     session['chaotic_seed'] = random_seed
-    
-    return {'seed': random_seed, 'mu': 3.99} # Trả về seed và mu cho client
 
+    # AES-GCM encrypt seed
+    aesgcm = AESGCM(aes_key_derived)
+    iv = os.urandom(12)
+    ciphertext = aesgcm.encrypt(iv, str(random_seed).encode(), None)
+
+    return {
+        'iv': base64.b64encode(iv).decode(),
+        'encrypted_seed': base64.b64encode(ciphertext).decode()
+    }
 # --- Route Streaming Chaotic (đã chỉnh sửa để dùng khóa từ session) ---
 @app.route('/stream/<track>/chaotic')
 def stream_chaotic(track):
