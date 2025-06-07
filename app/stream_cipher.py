@@ -1,7 +1,7 @@
 from Crypto.Cipher import AES
 
 class ChaoticStreamCipher:
-    def __init__(self, seed=0.5, mu=3.99):
+    def __init__(self, seed, mu):
         # Logistic map parameters
         self.x = seed
         self.mu = mu

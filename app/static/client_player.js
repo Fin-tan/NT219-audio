@@ -1,5 +1,5 @@
 class ChaoticStreamCipher_js {
-    constructor(seed = 0.6, mu = 3.99) {
+    constructor(seed, mu) {
         this.x = seed;
         this.mu = mu;
     }
@@ -52,38 +52,6 @@ async function startPlayback() {
     if (mode === 'plain') {
         audioPlayer.src = `/static/${track}`;
         audioPlayer.play();
-
-    } else if (mode === 'aes') {
-        // Giữ nguyên logic AES (chú ý vấn đề lưu key trong localStorage)
-        // Trong hệ thống thực tế, bạn cũng sẽ lấy key AES theo session
-        const response = await fetch(`/stream/${track}/aes_encrypted`); // Đổi tên route để khớp với server
-        const arrayBuffer = await response.arrayBuffer();
-        const encryptedBytes = new Uint8Array(arrayBuffer);
-        const key = localStorage.getItem('aesKey'); // Key vẫn đang lấy từ localStorage
-        const iv = encryptedBytes.slice(0, 16);
-        const data = encryptedBytes.slice(16);
-        
-        try {
-            const cryptoKey = await window.crypto.subtle.importKey(
-                'raw',
-                hexStringToUint8Array(key),
-                { name: 'AES-CFB' },
-                false,
-                ['decrypt']
-            );
-            const decryptedArrayBuffer = await window.crypto.subtle.decrypt(
-                { name: 'AES-CFB', iv: iv },
-                cryptoKey,
-                data
-            );
-            const blob = new Blob([decryptedArrayBuffer], { type: 'audio/mpeg' });
-            audioPlayer.src = URL.createObjectURL(blob);
-            audioPlayer.play();
-        } catch (e) {
-            console.error("Lỗi giải mã AES. Key hoặc dữ liệu có thể không đúng:", e);
-            alert("Không thể giải mã file AES. Vui lòng kiểm tra khóa hoặc file.");
-        }
-
     } else if (mode === 'chaotic') {
         // --- BƯỚC MỚI: Yêu cầu seed từ Server ---
         let chaoticSeed = null;
