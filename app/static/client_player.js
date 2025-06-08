@@ -149,7 +149,7 @@ async function startPlayback() {
         console.log('[CLIENT] Seed Chaotic đã giải mã:', chaoticSeed);
 
         // --- Thiết lập MediaSource và streaming như cũ ---
-        const scc = new ChaoticStreamCipher_js(chaoticSeed, 3.99);
+         const scc = new ChaoticStreamCipher_js(chaoticSeed, 3.99);
         const source = new MediaSource();
         audioPlayer.src = URL.createObjectURL(source);
 
@@ -159,13 +159,24 @@ async function startPlayback() {
             const response = await fetch(`/stream/${track}/chaotic`);
             const reader = response.body.getReader();
             let isPlaying = false;
+
+            let chunkCount = 0; // Thêm biến đếm chunk
+            let totalBytesReceived = 0; // Thêm biến tổng số byte đã nhận
+
             while (true) {
                 const { done, value } = await reader.read();
                 if (done) {
+                    console.log(`[Chaotic Stream] Kết thúc nhận chunk. Tổng số ${chunkCount} chunk đã nhận.`); // Log khi kết thúc
+                    console.log(`[Chaotic Stream] Tổng số byte đã nhận: ${totalBytesReceived} bytes.`); // Log tổng số byte
                     if (!buffer.updating) source.endOfStream();
                     else buffer.addEventListener('updateend', () => source.endOfStream(), { once: true });
                     break;
                 }
+
+                chunkCount++; // Tăng biến đếm chunk
+                totalBytesReceived += value.length; // Cộng dồn số byte
+                console.log(`[Chaotic Stream] Đã nhận chunk số ${chunkCount}: ${value.length} bytes.`); // Log số byte của mỗi chunk
+                
                 const decrypted = scc.decrypt(value);
                 while (buffer.updating) {
                     await new Promise(r => setTimeout(r, 10));
