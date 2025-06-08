@@ -2,12 +2,13 @@ import os
 import secrets # Để tạo khóa/seed ngẫu nhiên an toàn
 from flask import Flask, render_template, request, session, redirect, url_for, Response, abort, send_from_directory
 from flask_session import Session # Để quản lý session
-
+from storage_gcm_db import get_encrypted_blob, kms_client as kms
+import sqlite3
 
 # Giả định ChaoticStreamCipher và aes_key đã được định nghĩa
 from stream_cipher import ChaoticStreamCipher
 # from storage import aes_key # Nếu bạn muốn dùng aes_key từ file khác
-from storage_gcm_db import init_db, encrypt_and_save_to_db, get_encrypted_blob, aes_key
+from storage_gcm_db import init_db, encrypt_and_save_to_db, get_encrypted_blob
 from Crypto.Cipher import AES as PyAES  # Dùng để giải mã AES-CFB nếu cần
 # >>> ECC START: import thêm cho ECDH + AESGCM
 import os, base64, secrets
@@ -37,13 +38,20 @@ server_pub_pem = server_pub_key.public_bytes(
 # --- Cấu hình đường dẫn file ---
 BASE_PATH = os.path.join(os.path.dirname(__file__), 'static')
 ENCRYPTED_DIR = os.path.join(os.path.dirname(__file__), 'encrypted')
+DB_PATH = os.path.join(os.path.dirname(__file__), 'tracks.db')
 
 if not os.path.exists(ENCRYPTED_DIR):
     os.makedirs(ENCRYPTED_DIR)
 
 # --- Helper function để lấy danh sách tracks ---
 def get_tracks():
-    return [f for f in os.listdir(BASE_PATH) if f.lower().endswith(('.mp3', '.wav'))]
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM tracks_gcm;")
+    tracks = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return tracks
+
 
 # --- USER MOCK (Thay thế bằng database trong thực tế) ---
 USERS = {'user': 'password123'} # Tài khoản demo
@@ -136,21 +144,40 @@ def stream_chaotic(track):
     if chaotic_seed is None:
         return abort(400, "Chaotic session key not established. Please request key first.")
 
-    src_path = os.path.join(BASE_PATH, track)
-    if not os.path.isfile(src_path): return abort(404)
-    mime = 'audio/wav' if track.lower().endswith('.wav') else 'audio/mpeg'
+    # Bước 2: Lấy blob AES-GCM từ DB
+    record = get_encrypted_blob(track)
+    if record is None:
+        return abort(404, f"Track '{track}' chưa được mã hoá trong database.")
+    encrypted_key_blob, data_blob = record
+
+    # Bước 3: Dùng KMS giải mã data-key
+    try:
+        kms_resp = kms.decrypt(CiphertextBlob=encrypted_key_blob)
+        data_key_plain = kms_resp['Plaintext']
+    except Exception as e:
+        app.logger.error(f"KMS decrypt data key failed: {e}")
+        return abort(500, "Internal decryption error.")
+
+    # Bước 4: Tách nonce, tag, ciphertext
+    nonce, tag, ciphertext = data_blob[:12], data_blob[12:28], data_blob[28:]
+
+    # Bước 5: Giải mã AES-GCM để lấy plaintext toàn bộ file
+    try:
+        aes_cipher = PyAES.new(data_key_plain, PyAES.MODE_GCM, nonce=nonce)
+        plaintext_all = aes_cipher.decrypt_and_verify(ciphertext, tag)
+    except Exception as e:
+        app.logger.error(f"AES-GCM decrypt failed for {track}: {e}")
+        return abort(500, "AES-GCM decrypt failed.")
 
     def generate():
-        # KHỞI TẠO CIPHER VỚI SEED TỪ SESSION
-        scc = ChaoticStreamCipher(seed=chaotic_seed, mu=3.99) 
-        
-        with open(src_path, 'rb') as f:
-            while True:
-                chunk = f.read(1024)
-                if not chunk: break
-                yield scc.encrypt(chunk)
-    return Response(generate(), mimetype=mime)
+        scc = ChaoticStreamCipher(seed=chaotic_seed, mu=3.99)
+        chunk_size = 1024
+        for i in range(0, len(plaintext_all), chunk_size):
+            plain_chunk = plaintext_all[i:i+chunk_size]
+            yield scc.encrypt(plain_chunk)
 
+    mime = 'audio/wav' if track.lower().endswith('.wav') else 'audio/mpeg'
+    return Response(generate(), mimetype=mime)
 # --- Các route khác (plain, aes) có thể giữ nguyên hoặc chỉnh sửa tương tự ---
 @app.route('/static/<path:filename>')
 def serve_static(filename):
@@ -181,48 +208,48 @@ def stream_aesgcm(track):
     return Response(blob, mimetype='application/octet-stream')
 
 # --- Route Stream AES→Chaotic (Hybrid) ---
-@app.route('/stream/<track>/aeschaotic')
-def stream_aes_chaotic(track):
-    if 'logged_in' not in session or not session['logged_in']:
-        return abort(401)
+# @app.route('/stream/<track>/aeschaotic')
+# def stream_aes_chaotic(track):
+#     if 'logged_in' not in session or not session['logged_in']:
+#         return abort(401)
 
-    # Bước 1: Lấy seed Chaotic từ session
-    chaotic_seed = session.get('chaotic_seed')
-    if chaotic_seed is None:
-        return abort(400, "Chaotic session key not established. Please request key first.")
+#     # Bước 1: Lấy seed Chaotic từ session
+#     chaotic_seed = session.get('chaotic_seed')
+#     if chaotic_seed is None:
+#         return abort(400, "Chaotic session key not established. Please request key first.")
 
-    # Bước 2: Lấy blob AES-GCM từ DB
-    blob = get_encrypted_blob(track)
-    if blob is None:
-        return abort(404, f"Track '{track}' chưa được mã hoá trong database.")
+#     # Bước 2: Lấy blob AES-GCM từ DB
+#     blob = get_encrypted_blob(track)
+#     if blob is None:
+#         return abort(404, f"Track '{track}' chưa được mã hoá trong database.")
 
-    mime = 'audio/wav' if track.lower().endswith('.wav') else 'audio/mpeg'
+#     mime = 'audio/wav' if track.lower().endswith('.wav') else 'audio/mpeg'
 
-    def generate():
-        # Tách nonce (12 bytes), tag (16 bytes), ciphertext còn lại
-        nonce = blob[:12]
-        tag = blob[12:28]
-        ciphertext = blob[28:]
+#     def generate():
+#         # Tách nonce (12 bytes), tag (16 bytes), ciphertext còn lại
+#         nonce = blob[:12]
+#         tag = blob[12:28]
+#         ciphertext = blob[28:]
 
-        # Khởi tạo AES-GCM decryptor
-        aes_cipher = PyAES.new(aes_key, PyAES.MODE_GCM, nonce=nonce)
-        try:
-            plaintext_all = aes_cipher.decrypt_and_verify(ciphertext, tag)
-        except Exception as e:
-            # Nếu giải mã thất bại, trả 500
-            app.logger.error(f"AES-GCM decrypt failed for {track}: {e}")
-            abort(500, "AES-GCM decrypt failed.")
+#         # Khởi tạo AES-GCM decryptor
+#         aes_cipher = PyAES.new(aes_key, PyAES.MODE_GCM, nonce=nonce)
+#         try:
+#             plaintext_all = aes_cipher.decrypt_and_verify(ciphertext, tag)
+#         except Exception as e:
+#             # Nếu giải mã thất bại, trả 500
+#             app.logger.error(f"AES-GCM decrypt failed for {track}: {e}")
+#             abort(500, "AES-GCM decrypt failed.")
 
-        # Khởi tạo ChaoticStreamCipher (để xor mã hoá) với seed từ session
-        scc = ChaoticStreamCipher(seed=chaotic_seed, mu=3.99)
+#         # Khởi tạo ChaoticStreamCipher (để xor mã hoá) với seed từ session
+#         scc = ChaoticStreamCipher(seed=chaotic_seed, mu=3.99)
 
-        # Chia plaintext thành chunk 1024 byte và chaotic-encrypt từng chunk
-        chunk_size = 1024
-        for i in range(0, len(plaintext_all), chunk_size):
-            plain_chunk = plaintext_all[i:i+chunk_size]
-            yield scc.encrypt(plain_chunk)
+#         # Chia plaintext thành chunk 1024 byte và chaotic-encrypt từng chunk
+#         chunk_size = 1024
+#         for i in range(0, len(plaintext_all), chunk_size):
+#             plain_chunk = plaintext_all[i:i+chunk_size]
+#             yield scc.encrypt(plain_chunk)
 
-    return Response(generate(), mimetype=mime)
+#     return Response(generate(), mimetype=mime)
 
 if __name__ == '__main__':
     init_db()
