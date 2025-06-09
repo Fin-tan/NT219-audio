@@ -9,10 +9,7 @@ from boto3.session import Session
 # Configuration
 # ---------------------------
 DB_PATH = os.path.join(os.path.dirname(__file__), 'tracks.db')
-KMS_KEY_ID = (
-    'arn:aws:kms:ap-southeast-2:333207083244:'
-    'key/1f707328-5ac6-4d10-8b27-b6ee0aaeafe5'
-)
+KMS_KEY_ID= os.getenv('AWS_KMS_KEY_ID')
 
 # Read AWS credentials from environment
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
