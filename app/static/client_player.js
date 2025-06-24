@@ -42,160 +42,118 @@ function hexStringToUint8Array(hex) {
     }
     return u8;
 }
-
-document.getElementById('playButton').addEventListener('click', startPlayback);
+window.addEventListener('DOMContentLoaded', () => {
+   const btn = document.getElementById('playButton');
+   if (btn) {
+     btn.addEventListener('click', startPlayback);
+   }
+ });
 
 async function startPlayback() {
-    const trackSelect = document.getElementById('trackSelect');
-    const mode = document.querySelector('input[name="mode"]:checked').value;
-    const audioPlayer = document.getElementById('audioPlayer');
-    const track = trackSelect.value;
+  const trackSelect = document.getElementById('trackSelect');
+  const mode = document.querySelector('input[name="mode"]:checked').value;
+  const audioPlayer = document.getElementById('audioPlayer');
+  const track = trackSelect.value;
 
-    audioPlayer.pause();
-    audioPlayer.src = '';
+  audioPlayer.pause();
+  audioPlayer.src = '';
 
-    // Kiểm tra login (JS client-side)
-    // Tùy thuộc vào cách bạn xử lý xác thực trên client
-    // Hiện tại Flask sẽ chuyển hướng nếu chưa login, nên phần này có thể không cần thiết
-    // nhưng tốt để có nếu bạn có logic JS phức tạp hơn.
+  if (mode === 'plain') {
+    // Plain streaming
+    audioPlayer.src = `/static/${track}`;
+    audioPlayer.play();
+  }
+  else if (mode === 'chaotic') {
+    // Chaotic streaming per-frame
+    // Step 1: ECDH/AES-GCM to get initial seed
+    const serverPem = await fetch('/ecdh/server_pub_key').then(r => r.text());
+    const serverPubDer = pemToArrayBuffer(serverPem);
+    const serverPubKey = await crypto.subtle.importKey(
+      'spki', serverPubDer, { name: 'ECDH', namedCurve: 'P-256' }, false, []
+    );
+    const clientKeyPair = await crypto.subtle.generateKey(
+      { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
+    );
+    const clientPubRaw = await crypto.subtle.exportKey('raw', clientKeyPair.publicKey);
+    const clientPubB64 = btoa(String.fromCharCode(...new Uint8Array(clientPubRaw)));
+    const sharedBits = await crypto.subtle.deriveBits(
+      { name: 'ECDH', public: serverPubKey }, clientKeyPair.privateKey, 256
+    );
+    const hkdfKey = await crypto.subtle.importKey(
+      'raw', sharedBits, { name: 'HKDF' }, false, ['deriveKey']
+    );
+    const aesKey = await crypto.subtle.deriveKey(
+      { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array([]), info: new TextEncoder().encode('chaotic-seed') },
+      hkdfKey,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['decrypt']
+    );
+    const resp = await fetch('/ecdh/request_seed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_pub: clientPubB64 })
+    });
+    const { iv: iv_b64, encrypted_seed: enc_b64 } = await resp.json();
+    const iv = Uint8Array.from(atob(iv_b64), c => c.charCodeAt(0));
+    const ciphertext = Uint8Array.from(atob(enc_b64), c => c.charCodeAt(0));
+    const seedBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, ciphertext);
+    const chaoticSeed = parseFloat(new TextDecoder().decode(seedBuf));
 
-    if (mode === 'plain') {
-        audioPlayer.src = `/static/${track}`;
-        audioPlayer.play();
-    } else if (mode === 'chaotic') {
-        // --- BƯỚC 1: Lấy public key của server (PEM) và import sang CryptoKey ---
-        const serverPem = await fetch('/ecdh/server_pub_key').then(r => r.text());
-        const serverPubDer = pemToArrayBuffer(serverPem);
-        const serverPubKey = await crypto.subtle.importKey(
-            'spki',
-            serverPubDer,
-            { name: 'ECDH', namedCurve: 'P-256' },
-            false,
-            []
-        );
+    // Step 2: MediaSource + per-frame decrypt
+    const mediaSource = new MediaSource();
+    audioPlayer.src = URL.createObjectURL(mediaSource);
 
-        // --- BƯỚC 2: Sinh cặp key ECDH cho client ---
-        const clientKeyPair = await crypto.subtle.generateKey(
-            { name: 'ECDH', namedCurve: 'P-256' },
-            true,
-            ['deriveKey', 'deriveBits']
-        );
+    mediaSource.addEventListener('sourceopen', async () => {
+      const sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+      const reader = (await fetch(`/stream/${track}/chaotic`)).body.getReader();
+      let isPlaying = false;
 
-        const clientPubRaw = await crypto.subtle.exportKey('raw', clientKeyPair.publicKey);
-        const clientPubB64 = btoa(String.fromCharCode(...new Uint8Array(clientPubRaw)));
-
-        // --- BƯỚC 3: Derive AES-GCM key từ shared secret ---
-        // --- BƯỚC 3 MỚI: deriveBits rồi HKDF → AES-GCM key
-
-        // 3.1. Derive raw shared secret (256 bits) dưới dạng ArrayBuffer
-        const sharedBits = await crypto.subtle.deriveBits(
-            { name: 'ECDH', public: serverPubKey },
-            clientKeyPair.privateKey,
-            256
-        );
-
-        // 3.2. Import raw shared secret làm HKDF key
-        const hkdfKey = await crypto.subtle.importKey(
-            'raw',
-            sharedBits,
-            { name: 'HKDF' },
-            false,
-            ['deriveKey']
-        );
-
-        // 3.3. HKDF derive chính xác như server: SHA-256, salt = empty, info = "chaotic-seed"
-        const aesKey = await crypto.subtle.deriveKey(
-            {
-                name: 'HKDF',
-                hash: 'SHA-256',
-                salt: new Uint8Array([]),
-                info: new TextEncoder().encode('chaotic-seed')
-            },
-            hkdfKey,
-            { name: 'AES-GCM', length: 256 },
-            false,
-            ['decrypt']
-        );
-
-        // --- BƯỚC 4: Gửi public key client để lấy seed đã mã hóa ---
-        const resp = await fetch('/ecdh/request_seed', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ client_pub: clientPubB64 })
-        });
-        if (!resp.ok) {
-            alert('Không thể lấy khóa streaming. Vui lòng thử lại.');
-            return;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          await new Promise(r => {
+            if (!sourceBuffer.updating) return r();
+            sourceBuffer.addEventListener('updateend', r, { once: true });
+          });
+          mediaSource.endOfStream();
+          break;
         }
-        const { iv: iv_b64, encrypted_seed: enc_b64 } = await resp.json();
 
-        // --- BƯỚC 5: Giải mã AES-GCM để lấy seed Chaotic ---
-        const iv = Uint8Array.from(atob(iv_b64), c => c.charCodeAt(0));
-        const ciphertext = Uint8Array.from(atob(enc_b64), c => c.charCodeAt(0));
-        let seedStr;
+        // 1) Unpack 8-byte seed
+        const header = value.slice(0, 8);
+        const seed = new DataView(header.buffer).getFloat64(0);
+
+        // 2) Encrypted frame data
+        const encryptedFrame = value.slice(8);
+
+        // 3) Init cipher for this frame
+        const frameCipher = new ChaoticStreamCipher_js(seed, 3.99);
+
+        // 4) Decrypt frame
+        const decryptedFrame = frameCipher.decrypt(encryptedFrame);
+
+        // 5) Append to SourceBuffer
+        await new Promise(r => {
+          if (!sourceBuffer.updating) return r();
+          sourceBuffer.addEventListener('updateend', r, { once: true });
+        });
         try {
-            const seedBuf = await crypto.subtle.decrypt(
-                { name: 'AES-GCM', iv },
-                aesKey,
-                ciphertext
-            );
-            seedStr = new TextDecoder().decode(seedBuf);
+          sourceBuffer.appendBuffer(decryptedFrame);
         } catch (e) {
-            console.error('Giải mã seed thất bại:', e);
-            alert('Khóa streaming không hợp lệ. Vui lòng thử lại.');
-            return;
+          console.error('appendBuffer error:', e);
+          mediaSource.endOfStream('decode');
+          break;
         }
-        const chaoticSeed = parseFloat(seedStr);
-        console.log('[CLIENT] Seed Chaotic đã giải mã:', chaoticSeed);
 
-        // --- Thiết lập MediaSource và streaming như cũ ---
-         const scc = new ChaoticStreamCipher_js(chaoticSeed, 3.99);
-        const source = new MediaSource();
-        audioPlayer.src = URL.createObjectURL(source);
-
-        source.addEventListener('sourceopen', async () => {
-            const mimeCodec = 'audio/mpeg';
-            const buffer = source.addSourceBuffer(mimeCodec);
-            const response = await fetch(`/stream/${track}/chaotic`);
-            const reader = response.body.getReader();
-            let isPlaying = false;
-
-            let chunkCount = 0; // Thêm biến đếm chunk
-            let totalBytesReceived = 0; // Thêm biến tổng số byte đã nhận
-
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) {
-                    console.log(`[Chaotic Stream] Kết thúc nhận chunk. Tổng số ${chunkCount} chunk đã nhận.`); // Log khi kết thúc
-                    console.log(`[Chaotic Stream] Tổng số byte đã nhận: ${totalBytesReceived} bytes.`); // Log tổng số byte
-                    if (!buffer.updating) source.endOfStream();
-                    else buffer.addEventListener('updateend', () => source.endOfStream(), { once: true });
-                    break;
-                }
-
-                chunkCount++; // Tăng biến đếm chunk
-                totalBytesReceived += value.length; // Cộng dồn số byte
-                console.log(`[Chaotic Stream] Đã nhận chunk số ${chunkCount}: ${value.length} bytes.`); // Log số byte của mỗi chunk
-                
-                const decrypted = scc.decrypt(value);
-                while (buffer.updating) {
-                    await new Promise(r => setTimeout(r, 10));
-                }
-                try {
-                    buffer.appendBuffer(decrypted);
-                    if (!isPlaying && audioPlayer.paused && buffer.buffered.length > 0) {
-                        audioPlayer.play().catch(e => console.error('Lỗi khi play audio:', e));
-                        isPlaying = true;
-                    }
-                } catch (e) {
-                    console.error('Lỗi appendBuffer:', e);
-                    source.endOfStream('decode');
-                    break;
-                }
-            }
-        });
-    }
-    else if (mode === 'aeschaotic') {
+        // 6) Auto-play on first data
+        if (!isPlaying && audioPlayer.paused && sourceBuffer.buffered.length > 0) {
+          audioPlayer.play().catch(err => console.error('play error:', err));
+          isPlaying = true;
+        }
+      }
+    });
+  }else if (mode === 'aeschaotic') {
         // Hybrid AES-GCM → Chaotic
         let chaoticSeed = null;
         try {

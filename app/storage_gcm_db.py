@@ -56,6 +56,7 @@ def init_db():
       - data: AES-GCM payload: nonce||tag||ciphertext (BLOB)
     """
     conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     conn.execute(
         '''
         CREATE TABLE IF NOT EXISTS tracks_gcm (
@@ -66,6 +67,17 @@ def init_db():
         );
         '''
     )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS track_metadata (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            track_name TEXT NOT NULL UNIQUE,
+            author TEXT NOT NULL,
+            view_count INTEGER NOT NULL DEFAULT 0,
+            upload_date TEXT NOT NULL DEFAULT (DATE('now')),
+            FOREIGN KEY(track_name) REFERENCES tracks_gcm(name) ON DELETE CASCADE
+        );
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_view_count ON track_metadata(view_count DESC);")
     conn.commit()
     conn.close()
 

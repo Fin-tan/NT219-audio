@@ -5,6 +5,21 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Streamer App</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        /* Layout */
+        .container { max-width: 800px; margin: 0 auto; padding: 20px; font-family: Arial, sans-serif; }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #ddd; padding-bottom: 10px; margin-bottom: 20px; }
+        .user-info a { margin-left: 15px; text-decoration: none; padding: 6px 12px; border-radius: 4px; background-color: #007BFF; color: white; transition: background-color 0.3s; }
+        .user-info a:hover { background-color: #0056b3; }
+        .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 20px; }
+        #playButton { padding: 8px 16px; border: none; border-radius: 4px; background-color: #28a745; color: white; cursor: pointer; transition: background-color 0.3s; }
+        #playButton:hover { background-color: #1e7e34; }
+        .track-list { list-style: none; padding: 0; }
+        .track-item { background: #f9f9f9; margin-bottom: 12px; padding: 12px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; }
+        .track-details { line-height: 1.4; }
+        .track-item a.play-link { padding: 6px 12px; background-color: #17a2b8; color: white; text-decoration: none; border-radius: 4px; transition: background-color 0.3s; }
+        .track-item a.play-link:hover { background-color: #117a8b; }
+    </style>
 </head>
 <body>
     <div class="container">
@@ -12,7 +27,10 @@
             <h1>Streamer App</h1>
             <div class="user-info">
                 <span>Xin chào, {{ username }}!</span>
-                <a href="/logout" class="logout-btn">Đăng xuất</a>
+                <a href="{{ url_for('logout') }}" class="logout-btn">Đăng xuất</a>
+                {% if role == 'author' %}
+                    <a href="{{ url_for('upload') }}" class="upload-btn">Upload track</a>
+                {% endif %}
             </div>
         </div>
         
@@ -20,7 +38,7 @@
             <label for="trackSelect">Chọn track:</label>
             <select id="trackSelect">
                 {% for track in tracks %}
-                    <option value="{{ track }}">{{ track }}</option>
+                    <option value="{{ track[0] }}">{{ track[0] }}</option>
                 {% endfor %}
             </select>
 
@@ -30,16 +48,33 @@
                 <label for="modePlain">Plain</label><br>
                 <input type="radio" id="modeChaotic" name="mode" value="chaotic">
                 <label for="modeChaotic">Chaotic (streaming)</label>
-            
             </fieldset>
 
             <button id="playButton">Play</button>
         </div>
 
         <audio id="audioPlayer" controls></audio>
-    </div>
 
-    <script src="{{ url_for('static', filename='stream_cipher.js') }}"></script>
+        <h2>Danh sách bài hát</h2>
+        <ul class="track-list">
+          {% for track in tracks %}
+            {% set name = track[0] %}
+            {% set author = track[1] %}
+            {% set views = track[2] %}
+            {% set date = track[3] %}
+            <li class="track-item">
+              <div class="track-details">
+                <strong>{{ name }}</strong><br>
+                Tác giả: {{ author }}<br>
+                Lượt nghe: {{ views }}<br>
+                Ngày up: {{ date }}
+              </div>
+            </li>
+          {% else %}
+            <li>Chưa có bài hát nào.</li>
+          {% endfor %}
+        </ul>
+    </div>
     <script src="{{ url_for('static', filename='client_player.js') }}"></script>
 </body>
 </html>

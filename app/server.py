@@ -1,10 +1,12 @@
-import os
+import os, math
 import secrets # Để tạo khóa/seed ngẫu nhiên an toàn
-from flask import Flask, render_template, request, session, redirect, url_for, Response, abort, send_from_directory
+from flask import Flask, render_template, request, session, redirect, url_for, Response, abort, send_from_directory, flash
+from werkzeug.utils import secure_filename
+
 from flask_session import Session # Để quản lý session
 from storage_gcm_db import get_encrypted_blob, kms_client as kms
 import sqlite3
-
+import struct, secrets
 # Giả định ChaoticStreamCipher và aes_key đã được định nghĩa
 from stream_cipher import ChaoticStreamCipher
 # from storage import aes_key # Nếu bạn muốn dùng aes_key từ file khác
@@ -39,6 +41,11 @@ server_pub_pem = server_pub_key.public_bytes(
 BASE_PATH = os.path.join(os.path.dirname(__file__), 'static')
 ENCRYPTED_DIR = os.path.join(os.path.dirname(__file__), 'encrypted')
 DB_PATH = os.path.join(os.path.dirname(__file__), 'tracks.db')
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+# Tạo thư mục nếu chưa có
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 if not os.path.exists(ENCRYPTED_DIR):
     os.makedirs(ENCRYPTED_DIR)
@@ -54,33 +61,39 @@ def get_tracks():
 
 
 # --- USER MOCK (Thay thế bằng database trong thực tế) ---
-USERS = {'user': 'password123'} # Tài khoản demo
+USERS = {
+    'user':   ('password123', 'listener'),
+    'author': ('authorpass',  'author'),
+}
+
 # ----------------------------------------------------
 
 # --- Route Trang chủ ---
 @app.route('/')
 def index():
-    # Kiểm tra xem người dùng đã đăng nhập chưa
-    if 'logged_in' not in session or not session['logged_in']:
-        return redirect(url_for('login')) # Chuyển hướng đến trang đăng nhập
-    
-    tracks = get_tracks()
-    return render_template('index.html', tracks=tracks, username=session.get('username', 'Guest'))
-
+    # Bắt buộc đã login và có role
+    if not session.get('logged_in') or session.get('role') is None:
+        return redirect(url_for('login'))
+    # TODO: thay bằng hàm get_tracks() để load track từ DB
+    tracks = get_tracks_with_meta()
+    return render_template('index.html',
+                           tracks=tracks,
+                           username=session.get('username'),
+                           role=session.get('role'))
 # --- Route Đăng nhập ---
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        if username in USERS and USERS[username] == password:
+        u = request.form['username']
+        p = request.form['password']
+        if u in USERS and USERS[u][0] == p:
             session['logged_in'] = True
-            session['username'] = username
-            session.permanent = True # Session kéo dài (cấu hình trong app.config)
+            session['username']  = u
+            session['role']      = USERS[u][1]
             return redirect(url_for('index'))
-        else:
-            return render_template('login.html', error='Tên đăng nhập hoặc mật khẩu không đúng!')
+        return render_template('login.html', error='Tên đăng nhập hoặc mật khẩu không đúng!')
     return render_template('login.html')
+
 
 # --- Route Đăng xuất ---
 @app.route('/logout')
@@ -137,53 +150,164 @@ def ecdh_request_seed():
 @app.route('/stream/<track>/chaotic')
 def stream_chaotic(track):
     if 'logged_in' not in session or not session['logged_in']:
-        return abort(401) # Unauthorized
-    
-    # Lấy seed từ session. Nếu không có, có thể do chưa gọi get_chaotic_session_key
-    chaotic_seed = session.get('chaotic_seed')
-    if chaotic_seed is None:
-        return abort(400, "Chaotic session key not established. Please request key first.")
+        return abort(401)
 
-    # Bước 2: Lấy blob AES-GCM từ DB
     record = get_encrypted_blob(track)
     if record is None:
-        return abort(404, f"Track '{track}' chưa được mã hoá trong database.")
+        return abort(404, f"Track '{track}' không tồn tại.")
     encrypted_key_blob, data_blob = record
 
-    # Bước 3: Dùng KMS giải mã data-key
     try:
         kms_resp = kms.decrypt(CiphertextBlob=encrypted_key_blob)
         data_key_plain = kms_resp['Plaintext']
     except Exception as e:
-        app.logger.error(f"KMS decrypt data key failed: {e}")
-        return abort(500, "Internal decryption error.")
+        app.logger.error(f"KMS decrypt failed: {e}")
+        return abort(500)
 
-    # Bước 4: Tách nonce, tag, ciphertext
     nonce, tag, ciphertext = data_blob[:12], data_blob[12:28], data_blob[28:]
-
-    # Bước 5: Giải mã AES-GCM để lấy plaintext toàn bộ file
+    aes_cipher = PyAES.new(data_key_plain, PyAES.MODE_GCM, nonce=nonce)
     try:
-        aes_cipher = PyAES.new(data_key_plain, PyAES.MODE_GCM, nonce=nonce)
         plaintext_all = aes_cipher.decrypt_and_verify(ciphertext, tag)
     except Exception as e:
-        app.logger.error(f"AES-GCM decrypt failed for {track}: {e}")
-        return abort(500, "AES-GCM decrypt failed.")
+        app.logger.error(f"AES-GCM decrypt failed: {e}")
+        return abort(500)
+
+    # Định nghĩa hàm parse MP3 frame
+    BITRATE_INDEXES = {1:32,2:40,3:48,4:56,5:64,6:80,7:96,8:112,9:128,10:160,11:192,12:224,13:256,14:320}
+    SAMPLING_RATES = {0:44100,1:48000,2:32000}
+    def get_frame_length(header):
+        b1,b2,b3,_ = header
+        if b1 != 0xFF or (b2 & 0xE0) != 0xE0:
+            return None
+        version = (b2 >> 3) & 0x3
+        layer = (b2 >> 1) & 0x3
+        if version != 3 or layer != 1:
+            return None
+        bi = (b3 >> 4) & 0xF
+        si = (b3 >> 2) & 0x3
+        pad = (b3 >> 1) & 0x1
+        br = BITRATE_INDEXES.get(bi)
+        sr = SAMPLING_RATES.get(si)
+        if not br or not sr:
+            return None
+        return int((144000 * br) / sr + pad)
+
+    def iter_mp3_frames(data):
+        i = 0
+        while i + 4 <= len(data):
+            header = data[i:i+4]
+            length = get_frame_length(header)
+            if not length or i + length > len(data):
+                i += 1
+                continue
+            yield data[i:i+length]
+            i += length
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    # 2. Tăng lượt xem
+    cursor.execute("""
+        UPDATE track_metadata
+           SET view_count = view_count + 1
+         WHERE track_name = ?
+    """, (track,))
+    conn.commit()
+
+    # 3. Lấy dữ liệu decrypt và trả chunk
+    cursor.execute(
+        'SELECT encrypted_key, data FROM tracks_gcm WHERE name = ?;',
+        (track,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        abort(404)
 
     def generate():
-        scc = ChaoticStreamCipher(seed=chaotic_seed, mu=3.99)
-        chunk_size = 1024
-        for i in range(0, len(plaintext_all), chunk_size):
-            plain_chunk = plaintext_all[i:i+chunk_size]
-            yield scc.encrypt(plain_chunk)
+        data = plaintext_all
+        data_len = len(data)
+        i = 0
 
-    mime = 'audio/wav' if track.lower().endswith('.wav') else 'audio/mpeg'
-    return Response(generate(), mimetype=mime)
+        # 1) Gửi từng frame chuẩn
+        while i + 4 <= data_len:
+            header = data[i:i+4]
+            length = get_frame_length(header)
+            if not length or i + length > data_len:
+                i += 1
+                continue
+
+            frame = data[i:i+length]
+            i += length
+
+            seed = secrets.randbelow(1_000_000_000) / 1_000_000_000.0
+            scc = ChaoticStreamCipher(seed=seed, mu=3.99)
+            encrypted = scc.encrypt(frame)
+            yield struct.pack('!d', seed) + encrypted
+
+        # 2) Gửi phần tail (nếu còn byte không parse được)
+        if i < data_len:
+            tail = data[i:]
+            seed = secrets.randbelow(1_000_000_000) / 1_000_000_000.0
+            scc = ChaoticStreamCipher(seed=seed, mu=3.99)
+            encrypted_tail = scc.encrypt(tail)
+            yield struct.pack('!d', seed) + encrypted_tail
+
+    return Response(generate(), mimetype='audio/mpeg')
+def get_tracks_with_meta():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT t.name, m.author, m.view_count, m.upload_date
+        FROM tracks_gcm AS t
+        LEFT JOIN track_metadata AS m
+          ON t.name = m.track_name
+        ORDER BY m.upload_date DESC
+    """)
+    data = cursor.fetchall()
+    conn.close()
+    # data: list of tuples (name, author, view_count, upload_date)
+    return data
 # --- Các route khác (plain, aes) có thể giữ nguyên hoặc chỉnh sửa tương tự ---
 @app.route('/static/<path:filename>')
 def serve_static(filename):
     if 'logged_in' not in session or not session['logged_in']:
         return abort(401) # Unauthorized
     return send_from_directory(BASE_PATH, filename)
+@app.route('/upload', methods=['GET', 'POST'])
+def upload():
+    if request.method == 'POST':
+        f = request.files['file']
+        if not f:
+            flash('Chưa chọn file!')
+            return redirect(request.url)
+
+        filename = secure_filename(f.filename)
+        tmp_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        f.save(tmp_path)
+
+        # 1. Mã hóa và lưu vào tracks_gcm
+        encrypt_and_save_to_db(tmp_path, filename)
+
+        # 2. Lấy tác giả: có thể từ session['username'] hoặc form input
+        author = session.get('username', 'Unknown')
+
+        # 3. Lưu metadata
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR IGNORE INTO track_metadata(track_name, author)
+            VALUES (?, ?)
+        """, (filename, author))
+        conn.commit()
+        conn.close()
+
+        os.remove(tmp_path)
+        flash('Upload thành công!')
+        return redirect(url_for('index'))
+    return render_template('upload.html')
+    
+
 
 # Route stream AES (ví dụ, cần chỉnh sửa để dùng key từ session hoặc quản lý key an toàn hơn)
 @app.route('/stream/<track>/aes_encrypted')
@@ -253,6 +377,7 @@ def stream_aesgcm(track):
 
 if __name__ == '__main__':
     init_db()
+    os.makedirs('encrypted_tmp', exist_ok=True)
     for fname in os.listdir(BASE_PATH):
         if fname.lower().endswith(('.mp3', '.wav')):
             full_path = os.path.join(BASE_PATH, fname)

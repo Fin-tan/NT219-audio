@@ -1,7 +1,9 @@
 from Crypto.Cipher import AES
-
+import math
 class ChaoticStreamCipher:
     def __init__(self, seed, mu):
+        if not (0 < seed < 1) or not math.isfinite(seed):
+            raise ValueError(f"[ChaoticStreamCipher] seed invalid: {seed}")
         # Logistic map parameters
         self.x = seed
         self.mu = mu
