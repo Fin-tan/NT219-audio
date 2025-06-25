@@ -1,6 +1,8 @@
 const SLIDING_WINDOW = 30; // giữ lại 30s âm thanh đã phát
-const PAST_WINDOW   = 5;   // Giữ lại tối đa 5s âm thanh đã phát
-const AHEAD_WINDOW  = 10;  // Giữ lại tối đa 10s âm thanh sắp phát
+const PAST_WINDOW   = 10;  // Giữ lại tối đa 10s âm thanh đã phát
+const AHEAD_WINDOW  = 15;  // Giữ lại tối đa 15s âm thanh sắp phát
+const CHUNK_DELAY_MS = 300; // chờ 300ms trước khi đọc chunk mới nếu buffer full
+
 class ChaoticStreamCipher_js {
     constructor(seed, mu) {
         this.x = seed;
@@ -51,6 +53,7 @@ async function startPlayback() {
   audioPlayer.src = '';
 
   if (mode === 'plain') {
+    // Chế độ phát thẳng file static
     audioPlayer.src = `/static/${track}`;
     audioPlayer.play();
 
@@ -90,77 +93,70 @@ async function startPlayback() {
     const seedBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, ciphertext);
     const chaoticSeed = parseFloat(new TextDecoder().decode(seedBuf));
 
-    // Setup MediaSource for streaming
+    // 2) Setup MediaSource for streaming
     const mediaSource = new MediaSource();
     audioPlayer.src = URL.createObjectURL(mediaSource);
 
-mediaSource.addEventListener('sourceopen', async () => {
-  const sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
-  const reader       = (await fetch(`/stream/${track}/chaotic`)).body.getReader();
-  let isPlaying      = false;
+    mediaSource.addEventListener('sourceopen', async () => {
+      const sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+      const reader = (await fetch(`/stream/${track}/chaotic`)).body.getReader();
+      let isPlaying = false;
 
-  const PAST_WINDOW    = 10;  // giữ 10s buffer cũ
-  const AHEAD_WINDOW   = 15;  // tối đa giữ 15s buffer tương lai
-  const CHUNK_DELAY_MS = 300; // chờ 300ms trước khi đọc chunk mới nếu buffer full
+      while (true) {
+        // 0) Throttle: chờ nếu ahead buffer đã vượt ngưỡng
+        if (audioPlayer.buffered.length) {
+          const ahead = audioPlayer.buffered.end(audioPlayer.buffered.length - 1) - audioPlayer.currentTime;
+          if (ahead > AHEAD_WINDOW) {
+            await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+            continue;
+          }
+        }
 
-  while (true) {
-    // —— 0) Throttle: chờ nếu ahead buffer đã vượt ngưỡng
-    if (audioPlayer.buffered.length) {
-      const ahead = audioPlayer.buffered.end(audioPlayer.buffered.length - 1) - audioPlayer.currentTime;
-      if (ahead > AHEAD_WINDOW) {
-        await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
-        continue; // quay lại kiểm tra trước khi đọc chunk mới
+        // 1) Đọc chunk từ server
+        const { done, value } = await reader.read();
+        if (done) {
+          mediaSource.endOfStream();
+          break;
+        }
+
+        // 2) Xoá phần buffer đã qua (> PAST_WINDOW)
+        if (!sourceBuffer.updating && audioPlayer.buffered.length) {
+          const cur = audioPlayer.currentTime;
+          const bufStart = audioPlayer.buffered.start(0);
+          const removeEnd = cur - PAST_WINDOW;
+          if (removeEnd > bufStart) {
+            sourceBuffer.remove(bufStart, removeEnd);
+            await new Promise(r => sourceBuffer.addEventListener('updateend', r, { once: true }));
+          }
+        }
+
+        // 3) Giải mã frame với ChaoticStreamCipher
+        const seedHeader = value.slice(4, 12);
+        const frameSeed = new DataView(seedHeader.buffer).getFloat64(0);
+        const encryptedFrame = value.slice(12);
+        const frameCipher = new ChaoticStreamCipher_js(frameSeed, 3.99);
+        const decryptedFrame = frameCipher.decrypt(encryptedFrame);
+
+        // 4) Chờ buffer sẵn sàng rồi append
+        await new Promise(r => {
+          if (!sourceBuffer.updating) return r();
+          sourceBuffer.addEventListener('updateend', r, { once: true });
+        });
+        try {
+          sourceBuffer.appendBuffer(decryptedFrame);
+        } catch (e) {
+          console.error('appendBuffer error:', e);
+          // Nếu muốn tự phục hồi, thay vì endOfStream bạn có thể reset MediaSource tại đây
+          mediaSource.endOfStream('decode');
+          break;
+        }
+
+        // 5) Khởi động play lần đầu khi đã có dữ liệu
+        if (!isPlaying && audioPlayer.paused && sourceBuffer.buffered.length) {
+          audioPlayer.play().catch(err => console.error('play error:', err));
+          isPlaying = true;
+        }
       }
-    }
-
-    // —— 1) Đọc chunk
-    const { done, value } = await reader.read();
-    if (done) {
-      mediaSource.endOfStream();
-      break;
-    }
-
-    // —— 2) Xoá phần quá cũ
-    if (!sourceBuffer.updating && audioPlayer.buffered.length) {
-      const cur       = audioPlayer.currentTime;
-      const bufStart  = audioPlayer.buffered.start(0);
-      const removeEnd = cur - PAST_WINDOW;
-      if (removeEnd > bufStart) {
-        sourceBuffer.remove(bufStart, removeEnd);
-        await new Promise(r => sourceBuffer.addEventListener('updateend', r, { once: true }));
-      }
-    }
-
-    // —— 3) Giải mã frame
-    const seedHeader    = value.slice(4, 12);
-    const frameSeed     = new DataView(seedHeader.buffer).getFloat64(0);
-    const encryptedFrame= value.slice(12);
-    const frameCipher   = new ChaoticStreamCipher_js(frameSeed, 3.99);
-    const decryptedFrame= frameCipher.decrypt(encryptedFrame);
-
-    // —— 4) Chờ sẵn sàng rồi append
-    await new Promise(r => {
-      if (!sourceBuffer.updating) return r();
-      sourceBuffer.addEventListener('updateend', r, { once: true });
     });
-    try {
-      sourceBuffer.appendBuffer(decryptedFrame);
-    } catch (e) {
-      console.error('appendBuffer error:', e);
-      mediaSource.endOfStream('decode');
-      break;
-    }
-
-    // —— 5) Bắt đầu play nếu chưa
-    if (!isPlaying && audioPlayer.paused && sourceBuffer.buffered.length) {
-      audioPlayer.play().catch(err => console.error('play error:', err));
-      isPlaying = true;
-    }
   }
-});
-
-
-
-    }
-
 }
