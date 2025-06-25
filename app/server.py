@@ -116,7 +116,7 @@ def ecdh_request_seed():
     if not client_pub_b64:
         abort(400, "Missing client public key")
 
-    # >>> CHỖ SỬA: decode base64 DER và load bằng load_der_public_key
+    #  decode base64 DER và load bằng load_der_public_key
     raw = base64.b64decode(client_pub_b64)
     try:
         client_pub = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), raw)
@@ -273,7 +273,6 @@ def get_tracks_with_meta():
     conn.close()
     # data: list of tuples (name, author, view_count, upload_date)
     return data
-# --- Các route khác (plain, aes) có thể giữ nguyên hoặc chỉnh sửa tương tự ---
 @app.route('/static/<path:filename>')
 def serve_static(filename):
     if 'logged_in' not in session or not session['logged_in']:
@@ -294,7 +293,7 @@ def upload():
         # 1. Mã hóa và lưu vào tracks_gcm
         encrypt_and_save_to_db(tmp_path, filename)
 
-        # 2. Lấy tác giả: có thể từ session['username'] hoặc form input
+        # 2. Lấy tác giả:
         author = session.get('username', 'Unknown')
 
         # 3. Lưu metadata
@@ -311,75 +310,6 @@ def upload():
         flash('Upload thành công!')
         return redirect(url_for('index'))
     return render_template('upload.html')
-    
-
-
-# Route stream AES (ví dụ, cần chỉnh sửa để dùng key từ session hoặc quản lý key an toàn hơn)
-@app.route('/stream/<track>/aes_encrypted')
-def stream_aes_encrypted(track):
-    if 'logged_in' not in session or not session['logged_in']:
-        return abort(401) # Unauthorized
-    # ... logic mã hóa AES và gửi file (cần quản lý key AES an toàn hơn)
-    # Tạm thời trả về file đã mã hóa nếu có
-    enc_path = os.path.join(ENCRYPTED_DIR, track + '.aes')
-    if not os.path.isfile(enc_path):
-        # Đây chỉ là ví dụ, trong thực tế bạn không nên mã hóa lại mỗi lần
-        # Bạn sẽ cần logic để mã hóa 1 lần khi upload hoặc dùng MediaBox/ffmpeg
-        # Để đơn giản, giả định file đã tồn tại cho demo
-        return abort(404, "Encrypted AES file not found.")
-    return send_from_directory(ENCRYPTED_DIR, track + '.aes')
-@app.route('/stream/<track>/aesgcm')
-def stream_aesgcm(track):
-    # Trả về nguyên blob (nonce‖tag‖ciphertext) để JS client giải mã AES-GCM
-    blob = get_encrypted_blob(track)
-    if blob is None:
-        return abort(404, f"Track '{track}' chưa được mã hoá trong database.")
-    return Response(blob, mimetype='application/octet-stream')
-
-# --- Route Stream AES→Chaotic (Hybrid) ---
-# @app.route('/stream/<track>/aeschaotic')
-# def stream_aes_chaotic(track):
-#     if 'logged_in' not in session or not session['logged_in']:
-#         return abort(401)
-
-#     # Bước 1: Lấy seed Chaotic từ session
-#     chaotic_seed = session.get('chaotic_seed')
-#     if chaotic_seed is None:
-#         return abort(400, "Chaotic session key not established. Please request key first.")
-
-#     # Bước 2: Lấy blob AES-GCM từ DB
-#     blob = get_encrypted_blob(track)
-#     if blob is None:
-#         return abort(404, f"Track '{track}' chưa được mã hoá trong database.")
-
-#     mime = 'audio/wav' if track.lower().endswith('.wav') else 'audio/mpeg'
-
-#     def generate():
-#         # Tách nonce (12 bytes), tag (16 bytes), ciphertext còn lại
-#         nonce = blob[:12]
-#         tag = blob[12:28]
-#         ciphertext = blob[28:]
-
-#         # Khởi tạo AES-GCM decryptor
-#         aes_cipher = PyAES.new(aes_key, PyAES.MODE_GCM, nonce=nonce)
-#         try:
-#             plaintext_all = aes_cipher.decrypt_and_verify(ciphertext, tag)
-#         except Exception as e:
-#             # Nếu giải mã thất bại, trả 500
-#             app.logger.error(f"AES-GCM decrypt failed for {track}: {e}")
-#             abort(500, "AES-GCM decrypt failed.")
-
-#         # Khởi tạo ChaoticStreamCipher (để xor mã hoá) với seed từ session
-#         scc = ChaoticStreamCipher(seed=chaotic_seed, mu=3.99)
-
-#         # Chia plaintext thành chunk 1024 byte và chaotic-encrypt từng chunk
-#         chunk_size = 1024
-#         for i in range(0, len(plaintext_all), chunk_size):
-#             plain_chunk = plaintext_all[i:i+chunk_size]
-#             yield scc.encrypt(plain_chunk)
-
-#     return Response(generate(), mimetype=mime)
-
 if __name__ == '__main__':
     init_db()
     os.makedirs('encrypted_tmp', exist_ok=True)
