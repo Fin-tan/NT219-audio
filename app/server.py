@@ -2,7 +2,7 @@ import os, math
 import secrets # Để tạo khóa/seed ngẫu nhiên an toàn
 from flask import Flask, render_template, request, session, redirect, url_for, Response, abort, send_from_directory, flash
 from werkzeug.utils import secure_filename
-
+from flask import Response, stream_with_context
 from flask_session import Session # Để quản lý session
 from storage_gcm_db import get_encrypted_blob, kms_client as kms
 import sqlite3
@@ -226,34 +226,29 @@ def stream_chaotic(track):
 
     def generate():
         data = plaintext_all
-        data_len = len(data)
-        i = 0
-
-        # 1) Gửi từng frame chuẩn
-        while i + 4 <= data_len:
-            header = data[i:i+4]
-            length = get_frame_length(header)
-            if not length or i + length > data_len:
-                i += 1
-                continue
-
-            frame = data[i:i+length]
-            i += length
+        CHUNK_SIZE =  1024       # 16 KB mỗi đoạn
+        for offset in range(0, len(data), CHUNK_SIZE):
+            frame = data[offset : offset + CHUNK_SIZE]
 
             seed = secrets.randbelow(1_000_000_000) / 1_000_000_000.0
             scc = ChaoticStreamCipher(seed=seed, mu=3.99)
             encrypted = scc.encrypt(frame)
-            yield struct.pack('!d', seed) + encrypted
 
-        # 2) Gửi phần tail (nếu còn byte không parse được)
-        if i < data_len:
-            tail = data[i:]
-            seed = secrets.randbelow(1_000_000_000) / 1_000_000_000.0
-            scc = ChaoticStreamCipher(seed=seed, mu=3.99)
-            encrypted_tail = scc.encrypt(tail)
-            yield struct.pack('!d', seed) + encrypted_tail
+            # đóng gói: [4B độ dài][8B seed][payload]
+            chunk = (
+                struct.pack('!I', 8 + len(encrypted)) +
+                struct.pack('!d', seed) +
+                encrypted
+            )
+            # DEBUG
+            print(f"[DEBUG] Chunk #{offset//CHUNK_SIZE+1} → size={len(chunk)} seed={seed:.8f}")
+            yield chunk
 
-    return Response(generate(), mimetype='audio/mpeg')
+    # Trả về Response stream, định nghĩa đúng MIME type
+    return Response(
+        stream_with_context(generate()),
+        mimetype='audio/mpeg'
+    )
 def get_tracks_with_meta():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()

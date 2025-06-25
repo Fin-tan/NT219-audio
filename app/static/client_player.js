@@ -1,3 +1,6 @@
+const SLIDING_WINDOW = 30; // giữ lại 30s âm thanh đã phát
+const PAST_WINDOW   = 5;   // Giữ lại tối đa 5s âm thanh đã phát
+const AHEAD_WINDOW  = 10;  // Giữ lại tối đa 10s âm thanh sắp phát
 class ChaoticStreamCipher_js {
     constructor(seed, mu) {
         this.x = seed;
@@ -23,31 +26,20 @@ class ChaoticStreamCipher_js {
         return this.encrypt(data);
     }
 }
-// >>> ECC START: helper chuyển PEM to ArrayBuffer
+
+// Helper: PEM to ArrayBuffer
 function pemToArrayBuffer(pem) {
-    // loại bỏ header/footer
     const b64 = pem.replace(/-----(BEGIN|END)[\w\s]+-----/g, '').replace(/\s+/g, '');
     const bin = atob(b64);
     const arr = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
     return arr.buffer;
 }
-// <<< ECC END
 
-function hexStringToUint8Array(hex) {
-    const length = hex.length / 2;
-    const u8 = new Uint8Array(length);
-    for (let i = 0; i < length; i++) {
-        u8[i] = parseInt(hex.substr(i * 2, 2), 16);
-    }
-    return u8;
-}
 window.addEventListener('DOMContentLoaded', () => {
    const btn = document.getElementById('playButton');
-   if (btn) {
-     btn.addEventListener('click', startPlayback);
-   }
- });
+   if (btn) btn.addEventListener('click', startPlayback);
+});
 
 async function startPlayback() {
   const trackSelect = document.getElementById('trackSelect');
@@ -59,13 +51,11 @@ async function startPlayback() {
   audioPlayer.src = '';
 
   if (mode === 'plain') {
-    // Plain streaming
     audioPlayer.src = `/static/${track}`;
     audioPlayer.play();
-  }
-  else if (mode === 'chaotic') {
-    // Chaotic streaming per-frame
-    // Step 1: ECDH/AES-GCM to get initial seed
+
+  } else if (mode === 'chaotic') {
+    // 1) ECDH/AES-GCM to get initial seed
     const serverPem = await fetch('/ecdh/server_pub_key').then(r => r.text());
     const serverPubDer = pemToArrayBuffer(serverPem);
     const serverPubKey = await crypto.subtle.importKey(
@@ -100,123 +90,77 @@ async function startPlayback() {
     const seedBuf = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, ciphertext);
     const chaoticSeed = parseFloat(new TextDecoder().decode(seedBuf));
 
-    // Step 2: MediaSource + per-frame decrypt
+    // Setup MediaSource for streaming
     const mediaSource = new MediaSource();
     audioPlayer.src = URL.createObjectURL(mediaSource);
 
-    mediaSource.addEventListener('sourceopen', async () => {
-      const sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
-      const reader = (await fetch(`/stream/${track}/chaotic`)).body.getReader();
-      let isPlaying = false;
+mediaSource.addEventListener('sourceopen', async () => {
+  const sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+  const reader       = (await fetch(`/stream/${track}/chaotic`)).body.getReader();
+  let isPlaying      = false;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-          await new Promise(r => {
-            if (!sourceBuffer.updating) return r();
-            sourceBuffer.addEventListener('updateend', r, { once: true });
-          });
-          mediaSource.endOfStream();
-          break;
-        }
+  const PAST_WINDOW    = 10;  // giữ 10s buffer cũ
+  const AHEAD_WINDOW   = 15;  // tối đa giữ 15s buffer tương lai
+  const CHUNK_DELAY_MS = 300; // chờ 300ms trước khi đọc chunk mới nếu buffer full
 
-        // 1) Unpack 8-byte seed
-        const header = value.slice(0, 8);
-        const seed = new DataView(header.buffer).getFloat64(0);
-
-        // 2) Encrypted frame data
-        const encryptedFrame = value.slice(8);
-
-        // 3) Init cipher for this frame
-        const frameCipher = new ChaoticStreamCipher_js(seed, 3.99);
-
-        // 4) Decrypt frame
-        const decryptedFrame = frameCipher.decrypt(encryptedFrame);
-
-        // 5) Append to SourceBuffer
-        await new Promise(r => {
-          if (!sourceBuffer.updating) return r();
-          sourceBuffer.addEventListener('updateend', r, { once: true });
-        });
-        try {
-          sourceBuffer.appendBuffer(decryptedFrame);
-        } catch (e) {
-          console.error('appendBuffer error:', e);
-          mediaSource.endOfStream('decode');
-          break;
-        }
-
-        // 6) Auto-play on first data
-        if (!isPlaying && audioPlayer.paused && sourceBuffer.buffered.length > 0) {
-          audioPlayer.play().catch(err => console.error('play error:', err));
-          isPlaying = true;
-        }
+  while (true) {
+    // —— 0) Throttle: chờ nếu ahead buffer đã vượt ngưỡng
+    if (audioPlayer.buffered.length) {
+      const ahead = audioPlayer.buffered.end(audioPlayer.buffered.length - 1) - audioPlayer.currentTime;
+      if (ahead > AHEAD_WINDOW) {
+        await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+        continue; // quay lại kiểm tra trước khi đọc chunk mới
       }
+    }
+
+    // —— 1) Đọc chunk
+    const { done, value } = await reader.read();
+    if (done) {
+      mediaSource.endOfStream();
+      break;
+    }
+
+    // —— 2) Xoá phần quá cũ
+    if (!sourceBuffer.updating && audioPlayer.buffered.length) {
+      const cur       = audioPlayer.currentTime;
+      const bufStart  = audioPlayer.buffered.start(0);
+      const removeEnd = cur - PAST_WINDOW;
+      if (removeEnd > bufStart) {
+        sourceBuffer.remove(bufStart, removeEnd);
+        await new Promise(r => sourceBuffer.addEventListener('updateend', r, { once: true }));
+      }
+    }
+
+    // —— 3) Giải mã frame
+    const seedHeader    = value.slice(4, 12);
+    const frameSeed     = new DataView(seedHeader.buffer).getFloat64(0);
+    const encryptedFrame= value.slice(12);
+    const frameCipher   = new ChaoticStreamCipher_js(frameSeed, 3.99);
+    const decryptedFrame= frameCipher.decrypt(encryptedFrame);
+
+    // —— 4) Chờ sẵn sàng rồi append
+    await new Promise(r => {
+      if (!sourceBuffer.updating) return r();
+      sourceBuffer.addEventListener('updateend', r, { once: true });
     });
-  }else if (mode === 'aeschaotic') {
-        // Hybrid AES-GCM → Chaotic
-        let chaoticSeed = null;
-        try {
-            const keyResp = await fetch('/get_chaotic_session_key');
-            if (!keyResp.ok) {
-                if (keyResp.status === 401) {
-                    alert('Bạn chưa đăng nhập hoặc phiên đã hết hạn.');
-                    window.location.href = '/login';
-                    return;
-                }
-                throw new Error(`Server trả status ${keyResp.status}`);
-            }
-            chaoticSeed = (await keyResp.json()).seed;
-        } catch (e) {
-            console.error("Lỗi khi lấy Chaotic seed:", e);
-            alert("Không thể lấy Chaotic key. Vui lòng thử lại.");
-            return;
-        }
+    try {
+      sourceBuffer.appendBuffer(decryptedFrame);
+    } catch (e) {
+      console.error('appendBuffer error:', e);
+      mediaSource.endOfStream('decode');
+      break;
+    }
 
-        const scc = new ChaoticStreamCipher_js(chaoticSeed, 3.99);
-        const mediaSource = new MediaSource();
-        audioPlayer.src = URL.createObjectURL(mediaSource);
+    // —— 5) Bắt đầu play nếu chưa
+    if (!isPlaying && audioPlayer.paused && sourceBuffer.buffered.length) {
+      audioPlayer.play().catch(err => console.error('play error:', err));
+      isPlaying = true;
+    }
+  }
+});
 
-        mediaSource.addEventListener('sourceopen', async () => {
-            const mimeCodec = 'audio/mpeg';
-            const sourceBuffer = mediaSource.addSourceBuffer(mimeCodec);
-            const response = await fetch(`/stream/${track}/aeschaotic`);
-            if (!response.ok) {
-                console.error("Lỗi khi fetch AES-Chaotic stream:", response.status);
-                return;
-            }
-            const reader = response.body.getReader();
-            let isPlaying = false;
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) {
-                    if (!sourceBuffer.updating) {
-                        mediaSource.endOfStream();
-                    } else {
-                        sourceBuffer.addEventListener('updateend', () => mediaSource.endOfStream(), { once: true });
-                    }
-                    break;
-                }
-                // Đây là chunk plaintext đã được AES-GCM giải xong trên server, 
-                // nhưng sau đó server đã Chaotic-encrypt lại. 
-                // Bên client cần Chaotic-decrypt để lấy lại audio gốc.
-                const decryptedChunk = scc.decrypt(value);
-                while (sourceBuffer.updating) {
-                    await new Promise(res => setTimeout(res, 10));
-                }
-                try {
-                    sourceBuffer.appendBuffer(decryptedChunk);
-                    if (!isPlaying && audioPlayer.paused && sourceBuffer.buffered.length > 0) {
-                        audioPlayer.play().catch(e => console.error("Lỗi khi play audio:", e));
-                        isPlaying = true;
-                    }
-                } catch (e) {
-                    console.error("Lỗi appendBuffer (AES-Chaotic):", e);
-                    mediaSource.endOfStream("decode");
-                    break;
-                }
-            }
-        });
+
+
     }
 
 }
