@@ -17,7 +17,6 @@ AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 AWS_SESSION_TOKEN = os.getenv('AWS_SESSION_TOKEN')
 AWS_REGION = os.getenv('AWS_REGION', 'ap-southeast-2')
 AWS_PROFILE = os.getenv('AWS_PROFILE')
-
 # ---------------------------
 # Initialize KMS client
 # ---------------------------

@@ -226,23 +226,33 @@ def stream_chaotic(track):
 
     def generate():
         data = plaintext_all
-        CHUNK_SIZE =  1024       # 16 KB mỗi đoạn
-        for offset in range(0, len(data), CHUNK_SIZE):
-            frame = data[offset : offset + CHUNK_SIZE]
-
+        frames = list(iter_mp3_frames(data))
+        TARGET_CHUNK = 1024*128
+        buf = b''
+        chunk_idx = 0
+        for frame in frames:
+            if len(buf) + len(frame) > TARGET_CHUNK and buf:
+                # Đã có đủ buf: encrypt và yield
+                seed = secrets.randbelow(1_000_000_000) / 1_000_000_000.0
+                scc = ChaoticStreamCipher(seed=seed, mu=3.99)
+                encrypted = scc.encrypt(buf)
+                packet = struct.pack('!I', 8 + len(encrypted)) + struct.pack('!d', seed) + encrypted
+                chunk_idx += 1
+                print(f"[DEBUG] Chunk #{chunk_idx} → size={len(packet)} seed={seed:.8f}")
+                yield packet
+                buf = frame  # bắt đầu nhóm mới với frame hiện tại
+            else:
+                buf += frame
+    # Sau khi hết frames, xử lý phần dư
+        if buf:
             seed = secrets.randbelow(1_000_000_000) / 1_000_000_000.0
             scc = ChaoticStreamCipher(seed=seed, mu=3.99)
-            encrypted = scc.encrypt(frame)
+            encrypted = scc.encrypt(buf)
+            packet = struct.pack('!I', 8 + len(encrypted)) + struct.pack('!d', seed) + encrypted
+            chunk_idx += 1
+            print(f"[DEBUG] Chunk #{chunk_idx} → size={len(packet)} seed={seed:.8f}")
+            yield packet
 
-            # đóng gói: [4B độ dài][8B seed][payload]
-            chunk = (
-                struct.pack('!I', 8 + len(encrypted)) +
-                struct.pack('!d', seed) +
-                encrypted
-            )
-            # DEBUG
-            print(f"[DEBUG] Chunk #{offset//CHUNK_SIZE+1} → size={len(chunk)} seed={seed:.8f}")
-            yield chunk
 
     # Trả về Response stream, định nghĩa đúng MIME type
     return Response(

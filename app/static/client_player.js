@@ -43,17 +43,35 @@ window.addEventListener('DOMContentLoaded', () => {
    if (btn) btn.addEventListener('click', startPlayback);
 });
 
+let currentMediaSource = null;
+let currentAbortController = null; // Thêm biến này để quản lý fetch
+
 async function startPlayback() {
   const trackSelect = document.getElementById('trackSelect');
   const mode = document.querySelector('input[name="mode"]:checked').value;
   const audioPlayer = document.getElementById('audioPlayer');
   const track = trackSelect.value;
 
+  // --- RESET hoàn toàn trước khi play lại ---
   audioPlayer.pause();
-  audioPlayer.src = '';
+  audioPlayer.removeAttribute('src');
+  audioPlayer.load();
+
+  // Hủy MediaSource cũ nếu có
+  if (currentMediaSource) {
+    try {
+      currentMediaSource.endOfStream();
+    } catch {}
+    currentMediaSource = null;
+  }
+
+  // Hủy fetch cũ nếu có
+  if (currentAbortController) {
+    currentAbortController.abort();
+    currentAbortController = null;
+  }
 
   if (mode === 'plain') {
-    // Chế độ phát thẳng file static
     audioPlayer.src = `/static/${track}`;
     audioPlayer.play();
 
@@ -95,66 +113,89 @@ async function startPlayback() {
 
     // 2) Setup MediaSource for streaming
     const mediaSource = new MediaSource();
+    currentMediaSource = mediaSource;
     audioPlayer.src = URL.createObjectURL(mediaSource);
+
+    // Tạo AbortController mới cho fetch này
+    const abortController = new AbortController();
+    currentAbortController = abortController;
 
     mediaSource.addEventListener('sourceopen', async () => {
       const sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
-      const reader = (await fetch(`/stream/${track}/chaotic`)).body.getReader();
+      // Sử dụng signal để abort fetch khi chuyển bài
+      const response = await fetch(`/stream/${track}/chaotic`, { signal: abortController.signal });
+      const reader = response.body.getReader();
       let isPlaying = false;
+      let readBuffer = new Uint8Array(0);
 
-      while (true) {
-        // 0) Throttle: chờ nếu ahead buffer đã vượt ngưỡng
-        if (audioPlayer.buffered.length) {
-          const ahead = audioPlayer.buffered.end(audioPlayer.buffered.length - 1) - audioPlayer.currentTime;
-          if (ahead > AHEAD_WINDOW) {
-            await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
-            continue;
+      try {
+        while (true) {
+          // Throttle như trước...
+          if (audioPlayer.buffered.length) {
+            const ahead = audioPlayer.buffered.end(audioPlayer.buffered.length - 1) - audioPlayer.currentTime;
+            if (ahead > AHEAD_WINDOW) {
+              await new Promise(r => setTimeout(r, CHUNK_DELAY_MS));
+              continue;
+            }
+          }
+
+          const { done, value } = await reader.read();
+          if (done) {
+            mediaSource.endOfStream();
+            break;
+          }
+          // Append vào readBuffer
+          const newBuf = new Uint8Array(readBuffer.length + value.length);
+          newBuf.set(readBuffer, 0);
+          newBuf.set(value, readBuffer.length);
+          readBuffer = newBuf;
+
+          // Try parse as many full chunks as có thể
+          let offset = 0;
+          while (readBuffer.length - offset >= 4) {
+            const view = new DataView(readBuffer.buffer, offset, 4);
+            const lengthField = view.getUint32(0); // network-order
+            if (readBuffer.length - offset < 4 + lengthField) {
+              break; // chưa đủ dữ liệu cho chunk này
+            }
+            // Tách chunk
+            const chunk = readBuffer.slice(offset + 4, offset + 4 + lengthField);
+            // Lấy seed và encryptedFrame
+            const seedBuf = chunk.slice(0, 8);
+            const frameSeed = new DataView(seedBuf.buffer).getFloat64(0);
+            const encryptedFrame = chunk.slice(8);
+            // Giải mã
+            const frameCipher = new ChaoticStreamCipher_js(frameSeed, 3.99);
+            const decryptedFrame = frameCipher.decrypt(encryptedFrame);
+
+            // AppendBuffer khi sourceBuffer sẵn sàng
+            await new Promise(r => {
+              if (!sourceBuffer.updating) return r();
+              sourceBuffer.addEventListener('updateend', r, { once: true });
+            });
+            try {
+              sourceBuffer.appendBuffer(decryptedFrame);
+            } catch (e) {
+              console.error('appendBuffer error:', e);
+              mediaSource.endOfStream('decode');
+              return;
+            }
+            if (!isPlaying && audioPlayer.paused && sourceBuffer.buffered.length) {
+              audioPlayer.play().catch(err => console.error('play error:', err));
+              isPlaying = true;
+            }
+            offset += 4 + lengthField;
+          }
+          // Giữ lại phần dư (incomplete) vào readBuffer
+          if (offset > 0) {
+            readBuffer = readBuffer.slice(offset);
           }
         }
-
-        // 1) Đọc chunk từ server
-        const { done, value } = await reader.read();
-        if (done) {
-          mediaSource.endOfStream();
-          break;
-        }
-
-        // 2) Xoá phần buffer đã qua (> PAST_WINDOW)
-        if (!sourceBuffer.updating && audioPlayer.buffered.length) {
-          const cur = audioPlayer.currentTime;
-          const bufStart = audioPlayer.buffered.start(0);
-          const removeEnd = cur - PAST_WINDOW;
-          if (removeEnd > bufStart) {
-            sourceBuffer.remove(bufStart, removeEnd);
-            await new Promise(r => sourceBuffer.addEventListener('updateend', r, { once: true }));
-          }
-        }
-
-        // 3) Giải mã frame với ChaoticStreamCipher
-        const seedHeader = value.slice(4, 12);
-        const frameSeed = new DataView(seedHeader.buffer).getFloat64(0);
-        const encryptedFrame = value.slice(12);
-        const frameCipher = new ChaoticStreamCipher_js(frameSeed, 3.99);
-        const decryptedFrame = frameCipher.decrypt(encryptedFrame);
-
-        // 4) Chờ buffer sẵn sàng rồi append
-        await new Promise(r => {
-          if (!sourceBuffer.updating) return r();
-          sourceBuffer.addEventListener('updateend', r, { once: true });
-        });
-        try {
-          sourceBuffer.appendBuffer(decryptedFrame);
-        } catch (e) {
-          console.error('appendBuffer error:', e);
-          // Nếu muốn tự phục hồi, thay vì endOfStream bạn có thể reset MediaSource tại đây
-          mediaSource.endOfStream('decode');
-          break;
-        }
-
-        // 5) Khởi động play lần đầu khi đã có dữ liệu
-        if (!isPlaying && audioPlayer.paused && sourceBuffer.buffered.length) {
-          audioPlayer.play().catch(err => console.error('play error:', err));
-          isPlaying = true;
+      } catch (err) {
+        if (err.name === 'AbortError') {
+          // Đã chuyển bài, fetch bị abort, không báo lỗi
+        } else {
+          console.error('Streaming error:', err);
         }
       }
     });
